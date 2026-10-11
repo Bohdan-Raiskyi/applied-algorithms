@@ -1,0 +1,23 @@
++ apple
++ apple
+? apple
+- apple
+? apple
+- apple
+? apple
++ banana
+? banana
+- banana
+? banana
+- cherry
+? cherry
++ cherry
+? cherry
+- cherry
+? cherry
++ Mango
++ mango
+- Mango
+? Mango
+? mango
+#
