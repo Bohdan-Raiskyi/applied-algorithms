@@ -27,6 +27,10 @@ static bool isValidString(const string& s) {
     return true;
 }
 
+// ---------------------------------------------------------------------
+//   (4.1)  m = -n * ln(p) / (ln 2)^2      -- розмір бітового масиву
+//   (4.2)  l = (m / n) * ln 2             -- кількість хеш-функцій
+// ---------------------------------------------------------------------
 struct FilterParams {
     size_t m;
     int l;
@@ -46,6 +50,14 @@ static FilterParams computeParams(double n, double p) {
     return FilterParams{ m, l };
 }
 
+// ---------------------------------------------------------------------
+// Сім'я з l незалежних хеш-функцій.
+// i-та функція: поліноміальний хеш рядка  зі СВОЄЮ випадковою
+// непарною основою p_i, після
+// чого результат додатково перемішується (finalizer від splitmix64), щоб
+// біти хешу були рівномірними. Номер біта: hash(i, s) mod m.
+// Довжина рядка <= 15, тож одна хеш-функція рахується за O(1).
+// ---------------------------------------------------------------------
 class HashFamily {
 public:
     HashFamily(int l, uint64_t seed) : bases_(static_cast<size_t>(l)) {
@@ -57,7 +69,13 @@ public:
 
     uint64_t hash(int i, const string& s) const {
         const uint64_t p = bases_[static_cast<size_t>(i)];
-        uint64_t h = 0; // арифметика за модулем 2^64 (природне переповнення)
+        // Початкове значення 1, а не 0 (це "старший розряд"-одиниця
+        // многочлена). Інакше для рядка з ОДНОГО символу результат дорівнював
+        // би коду символу і не залежав від основи p_i, тож усі l функцій
+        // збіглися б (a_0 + 1 для будь-якого i). З одиницею h = p_i + a_0 + 1,
+        // тобто кожна функція залежить від власної основи при будь-якій
+        // довжині рядка; заодно рядки різної довжини розрізняються.
+        uint64_t h = 1; // арифметика за модулем 2^64 (природне переповнення)
         for (size_t k = s.size(); k-- > 0;)
             h = h * p + static_cast<uint64_t>(static_cast<unsigned char>(s[k])) + 1;
         return mix(h);
@@ -76,13 +94,16 @@ private:
     vector<uint64_t> bases_;
 };
 
-
+// ---------------------------------------------------------------------
+// Спільний інтерфейс фільтрів (щоб main працював з будь-яким із них).
+// ---------------------------------------------------------------------
 class IFilter {
 public:
     virtual ~IFilter() {}
     virtual void add(const string& s) = 0;
     virtual bool contains(const string& s) const = 0;
-    // Вилучення: повертає true, якщо вилучення виконано. Класичний фільтр його не підтримує.
+    // Вилучення: повертає true, якщо вилучення виконано. Класичний фільтр
+    // його не підтримує.
     virtual bool remove(const string&) { return false; }
     virtual bool supportsRemove() const { return false; }
     virtual double fillRatio() const = 0;   // частка зайнятих позицій
@@ -92,6 +113,7 @@ public:
     virtual int hashCount() const = 0;      // l
 };
 
+// Кількість одиничних біт у слові (портативна реалізація без intrinsics).
 static int popcount64(uint64_t x) {
     x = x - ((x >> 1) & 0x5555555555555555ULL);
     x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
@@ -99,6 +121,12 @@ static int popcount64(uint64_t x) {
     return static_cast<int>((x * 0x0101010101010101ULL) >> 56);
 }
 
+// ---------------------------------------------------------------------
+// Класичний фільтр Блума: масив з m біт.
+//   add(x):      встановлює 1 у позиціях h_0(x) .. h_{l-1}(x)
+//   contains(x): false, якщо хоч одна з позицій дорівнює 0, інакше true
+// Хибнонегативних немає; хибнопозитивні можливі з імовірністю ~p.
+// ---------------------------------------------------------------------
 class BloomFilter : public IFilter {
 public:
     BloomFilter(size_t m, int l, uint64_t seed)
@@ -137,7 +165,17 @@ private:
     vector<uint64_t> bits_;
 };
 
-
+// ---------------------------------------------------------------------
+// Фільтр Блума з лічильниками (вилучення "з підрахунком").
+// Замість біта -- 8-бітовий лічильник.
+//   add(x):    збільшує лічильники у l позиціях (до насичення 255)
+//   remove(x): зменшує ці лічильники, але ТІЛЬКИ якщо всі вони > 0
+//              (тобто x, імовірно, є у множині); насичений лічильник
+//              (255) не зменшується -- інакше можливі хибнонегативні
+//   contains:  усі l лічильників > 0
+// Повторне додавання того самого рядка збільшує лічильники двічі, тому
+// й вилучати його треба двічі (мультимножина).
+// ---------------------------------------------------------------------
 class CountingBloomFilter : public IFilter {
 public:
     CountingBloomFilter(size_t m, int l, uint64_t seed)
@@ -190,6 +228,9 @@ static unique_ptr<IFilter> makeFilter(bool counting, size_t m, int l, uint64_t s
     return unique_ptr<IFilter>(new BloomFilter(m, l, seed));
 }
 
+// ---------------------------------------------------------------------
+// Службові: параметри, статистика, самотест.
+// ---------------------------------------------------------------------
 static void printParams(const IFilter& f) {
     cerr << "Filter: " << f.name() << "\n"
         << "  capacity n = " << static_cast<long long>(kMaxElements)
@@ -219,18 +260,21 @@ static string randomString(mt19937_64& rng) {
     return s;
 }
 
+// Самотест на ЧИСТОМУ фільтрі тих самих параметрів (не змінює робочий фільтр).
 static void runSelfTest(bool counting, size_t m, int l,
     long long N, long long Q, uint64_t seed) {
     typedef chrono::steady_clock Clock;
     mt19937_64 rng(seed);
     unique_ptr<IFilter> f = makeFilter(counting, m, l, seed + 1);
 
+    // 1. Вставка N випадкових рядків (еталонна множина потрібна лише для тесту).
     unordered_set<string> ref;
     vector<string> items;
     ref.reserve(static_cast<size_t>(N));
     items.reserve(static_cast<size_t>(N));
     auto t0 = Clock::now();
-
+    // Вставляємо рівно N РІЗНИХ рядків: випадкові короткі рядки часто
+    // повторюються, а фільтр розрахований саме на n різних елементів.
     while (static_cast<long long>(items.size()) < N) {
         string s = randomString(rng);
         if (ref.insert(s).second) {
@@ -244,7 +288,7 @@ static void runSelfTest(bool counting, size_t m, int l,
     long long falseNeg = 0;
     for (const string& s : items) if (!f->contains(s)) ++falseNeg;
 
-    // 3. Хибнопозитивні: Q випадкових рядків, яких немає в еталоні.
+    // 3. Хибнопозитивні: Q випадкових рядків, яких ТОЧНО немає в еталоні.
     long long absent = 0, falsePos = 0;
     auto t2 = Clock::now();
     for (long long i = 0; i < Q; ++i) {
